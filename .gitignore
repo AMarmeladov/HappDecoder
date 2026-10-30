@@ -1,0 +1,37 @@
+# 🐍 Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# 📦 Сборка
+build/
+dist/
+*.spec
+*.manifest
+
+# 🖥️ Готовые бинарники (публикуются через Releases, а не в git)
+HappDecoder*.exe
+*.exe
+
+# 🔒 Личные данные и кэш программы
+device_profile.json
+router_config.json
+crypt5_keys.json
+*.log
+
+# 🗄️ Архивы и бэкапы
+*.bak
+*.rar
+*.zip
+*.7z
+
+# 🧰 Редакторы / ОС
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store

@@ -1,0 +1,8 @@
+# Зависимости декодера подписок (happ_gui.py)
+pycryptodome>=3.20
+requests>=2.31
+curl_cffi>=0.7
+paramiko>=3.4
+PyYAML>=6.0
+qrcode[pil]>=7.4
+PySocks>=1.7.1
