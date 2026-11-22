@@ -62,7 +62,7 @@ except ImportError:
 
 
 APP_NAME = "HappDecoder"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 
 
 def app_dir():
@@ -1698,6 +1698,18 @@ def _frag_encode(fragment):
     return urllib.parse.quote(urllib.parse.unquote(title), safe="")
 
 
+def _valid_reality_key(value):
+    """REALITY pbk must be a 32-byte X25519 key encoded as base64url (43 chars)."""
+    value = (value or "").strip()
+    if len(value) < 40:
+        return False
+    try:
+        raw = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+    except Exception:
+        return False
+    return len(raw) == 32
+
+
 def link_issues(link, service="Netshift"):
     """Return (fatal, warnings): problems sing-box would hit with this link."""
     fatal, warn = [], []
@@ -1726,8 +1738,14 @@ def link_issues(link, service="Netshift"):
                      or transport not in ("tcp", "raw", ""))):
             fatal.append("flow=xtls-rprx-vision требует TCP + TLS/REALITY")
 
-    if info.get("security") == "reality" and not info.get("pbk"):
-        fatal.append("REALITY без публичного ключа (pbk)")
+    if info.get("security") == "reality":
+        if not info.get("pbk"):
+            fatal.append("REALITY без публичного ключа (pbk)")
+        elif not _valid_reality_key(info["pbk"]):
+            fatal.append("некорректный pbk REALITY (нужен 32-байтный base64url)")
+        sid = str(info.get("sid") or "")
+        if sid and (len(sid) % 2 or not re.fullmatch(r"[0-9a-fA-F]+", sid)):
+            fatal.append("некорректный sid REALITY (hex, чётная длина)")
 
     if proto in ("vless", "vmess"):
         uid = str(info.get("uuid") or "")
@@ -1909,7 +1927,8 @@ def subscription_block_message(body, headers):
     support = _hget(headers, "support-url") or _hget(headers, "announce-url")
     if limit:
         msg = ("🔒 Панель сообщает, что лимит устройств (HWID) исчерпан. "
-               "Освободите слот устройства в личном кабинете/боте панели и повторите.")
+               "Освободите слот в боте/кабинете панели или укажите HWID уже "
+               "зарегистрированного устройства и повторите.")
     else:
         msg = ("🔒 Панель требует HWID. Включите маскировку клиента Happ/INCY "
                "или укажите зарегистрированный HWID в настройках.")
@@ -2016,7 +2035,6 @@ def resolve_subscription_body(body, sub_url, ident, log_fn, proxy=None, anon=Fal
             inner_body = fetch_direct(candidate, ident, log_fn, proxy=proxy, anon=anon)
         except SubscriptionBlocked as e:
             blocked = e
-            log_fn(f"⚠️ {str(e).splitlines()[0]}")
             continue
         except Exception as e:
             log_fn(f"⚠️ {str(e)[:90]}")
