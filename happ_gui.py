@@ -28,7 +28,7 @@ import requests as plain_requests
 
 try:
     from Crypto.PublicKey import RSA
-    from Crypto.Cipher import PKCS1_v1_5, ChaCha20_Poly1305
+    from Crypto.Cipher import AES, PKCS1_v1_5, ChaCha20_Poly1305
 except ImportError:
     import tkinter as _tk
     _r = _tk.Tk()
@@ -62,7 +62,7 @@ except ImportError:
 
 
 APP_NAME = "HappDecoder"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 
 
 def app_dir():
@@ -134,7 +134,7 @@ def pretty_name(s):
                 continue
         out.append(s[i])
         i += 1
-    return re.sub(r"\s+", " ", " ".join(out)).strip()
+    return re.sub(r"\s+", " ", "".join(out)).strip()
 
 
 def extract_country(name):
@@ -468,6 +468,18 @@ UA_FALLBACKS = [
     "Happ/1.0.0", "v2rayN/7.0.0", "v2rayNG/1.9.0",
 ]
 DEFAULT_ACCEPT_LANGUAGE = "ru-RU,en,*"
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36")
+BROWSER_HEADERS = {
+    "User-Agent": BROWSER_UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+}
 
 
 def build_subscription_headers(ident, ua=None):
@@ -635,10 +647,47 @@ def load_c5_keys():
     return _C5_KEYS_CACHE
 
 
+# INCY deep links (incy://crypt1/...) — AES-256-GCM with a fixed key derived
+# from the published key material of INCY-DEV/incy-link-encoder (the format is
+# documented there as obfuscation, not security). Wire format:
+#   base64url( iv[12] || ciphertext || tag[16] )
+# plaintext = compact JSON {"url": "...", "v": 1, "n": "..."(optional)}
+INCY_CRYPT1_KEY = bytes.fromhex(
+    "f6d40ea0c8a8899d7c682d09ba0d4165dfe2b3dd45e6bb3e25cb233cf00c2462"
+)
+
+
+def decrypt_incy_crypt1(payload):
+    payload = (payload or "").strip().rstrip("/")
+    if not payload:
+        raise Exception("INCY crypt1: пустой payload")
+    wire = b64_decode_bytes(payload)
+    if len(wire) < 12 + 16 + 1:
+        raise Exception("INCY crypt1: payload слишком короткий")
+    iv, ct_and_tag = wire[:12], wire[12:]
+    try:
+        cipher = AES.new(INCY_CRYPT1_KEY, AES.MODE_GCM, nonce=iv)
+        plain = cipher.decrypt_and_verify(ct_and_tag[:-16], ct_and_tag[-16:])
+    except Exception as e:
+        raise Exception(f"INCY crypt1: не удалось расшифровать ({str(e)[:60]})")
+    try:
+        data = json.loads(plain.decode("utf-8"))
+    except Exception:
+        raise Exception("INCY crypt1: некорректный JSON внутри ссылки")
+    url = (data.get("url") or "").strip() if isinstance(data, dict) else ""
+    if not url:
+        raise Exception("INCY crypt1: в ссылке нет URL подписки")
+    return url
+
+
 def decrypt_link(value):
     value = (value or "").strip()
     if value.startswith("happ://add/"):
         return value[len("happ://add/"):]
+    if value.startswith("incy://add/"):
+        return value[len("incy://add/"):]
+    if value.startswith("incy://crypt1/"):
+        return decrypt_incy_crypt1(value[len("incy://crypt1/"):])
     pkcs1_keys = _pkcs1_keys()
     prefixes = [
         ("happ://crypt5/", 4),
@@ -1554,9 +1603,10 @@ def parse_proxy_link(link):
         elif proto == "ss":
             raw_userinfo = (u.netloc or "").split("@")[0]
             decoded = _dec_b64(raw_userinfo)
-            if "@" in decoded and ":" in decoded.split("@", 1)[1]:
+            if "@" in decoded and ":" in decoded.rsplit("@", 1)[1]:
                 # legacy format: ss://base64(method:password@host:port)
-                creds, _, hostport = decoded.partition("@")
+                # password may contain '@' — split on the last one.
+                creds, _, hostport = decoded.rpartition("@")
                 addr, port_raw = _hostport_from_netloc(hostport)
                 port = _port_first(port_raw)
                 decoded = creds
@@ -1624,6 +1674,145 @@ def parse_proxy_link(link):
     return info
 
 
+# --- Compatibility with sing-box (NetShift 0.9.12 / Podkop 0.7.24) ----------
+# One malformed server can make sing-box reject the whole generated config, so
+# links are validated before they are written to the router.
+SB_SS_METHODS = {
+    "none", "aes-128-gcm", "aes-192-gcm", "aes-256-gcm",
+    "chacha20-ietf-poly1305", "xchacha20-ietf-poly1305",
+    "2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm",
+    "2022-blake3-chacha20-poly1305",
+}
+SB_TRANSPORTS = {
+    "", "tcp", "raw", "ws", "grpc", "http", "h2",
+    "httpupgrade", "quic", "xhttp", "splithttp",
+}
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def _frag_encode(fragment):
+    """Percent-encode a #fragment so spaces/quotes/emoji never break the parser."""
+    title = (fragment or "").split("?", 1)[0]
+    return urllib.parse.quote(urllib.parse.unquote(title), safe="")
+
+
+def link_issues(link, service="Netshift"):
+    """Return (fatal, warnings): problems sing-box would hit with this link."""
+    fatal, warn = [], []
+    info = parse_proxy_link(link)
+    proto = info.get("proto")
+
+    if not is_supported_by(service, link):
+        fatal.append(f"протокол {proto} не поддерживается {service}")
+
+    if not info.get("addr"):
+        fatal.append("не удалось разобрать адрес")
+    else:
+        try:
+            port = int(info.get("port") or 0)
+            if not 0 < port < 65536:
+                fatal.append(f"некорректный порт {port}")
+        except Exception:
+            fatal.append("некорректный порт")
+
+    transport = (info.get("type") or "tcp").lower()
+    if proto in ("vless", "vmess", "trojan"):
+        if transport not in SB_TRANSPORTS:
+            fatal.append(f"транспорт «{transport}» не поддерживается sing-box")
+        if (info.get("flow") == "xtls-rprx-vision"
+                and (info.get("security") not in ("tls", "reality")
+                     or transport not in ("tcp", "raw", ""))):
+            fatal.append("flow=xtls-rprx-vision требует TCP + TLS/REALITY")
+
+    if info.get("security") == "reality" and not info.get("pbk"):
+        fatal.append("REALITY без публичного ключа (pbk)")
+
+    if proto in ("vless", "vmess"):
+        uid = str(info.get("uuid") or "")
+        if not uid:
+            fatal.append("нет UUID")
+        elif not _UUID_RE.match(uid):
+            fatal.append("UUID не в формате RFC-4122 (8-4-4-4-12)")
+
+    if proto in ("trojan", "anytls", "hysteria2") and not info.get("password"):
+        fatal.append("нет пароля")
+    if proto == "tuic":
+        if not info.get("uuid"):
+            fatal.append("нет UUID")
+        if not info.get("password"):
+            fatal.append("нет пароля")
+    if proto == "ss":
+        method = str(info.get("method") or "").lower()
+        if not method:
+            fatal.append("не удалось определить метод шифрования")
+        elif method not in SB_SS_METHODS:
+            fatal.append(f"метод {method} не поддерживается sing-box")
+        if info.get("plugin") and info["plugin"] not in (
+                "obfs-local", "simple-obfs", "v2ray-plugin"):
+            warn.append(f"плагин {info['plugin']} требует отдельный бинарник")
+    if proto == "hysteria2":
+        obfs = (info.get("obfs") or "").lower()
+        if obfs and obfs not in ("salamander", "salamander2"):
+            warn.append(f"obfs «{obfs}» может не поддерживаться ядром")
+    if proto == "vmess":
+        cipher = str(info.get("cipher") or "auto").lower()
+        if cipher not in ("auto", "none", "zero", "aes-128-gcm",
+                          "chacha20-poly1305"):
+            warn.append(f"шифр VMess «{cipher}» нетипичен для sing-box")
+    if not (info.get("name") or "").strip():
+        warn.append("пустое имя сервера")
+    return fatal, warn
+
+
+def normalize_link_for_upload(link):
+    """Rewrite a link into the shape sing-box-extended parses most reliably."""
+    info = parse_proxy_link(link)
+    frag = ""
+    if "#" in link:
+        frag = "#" + _frag_encode(link.split("#", 1)[1])
+    if info.get("proto") != "ss":
+        if "#" in link:
+            return link.split("#", 1)[0] + frag
+        return link
+    method, password = info.get("method"), info.get("password")
+    if not method or password is None or not info.get("addr"):
+        return link
+    # SIP002: ss://base64url(method:password)@host:port?plugin=…#name
+    userinfo = base64.urlsafe_b64encode(
+        f"{method}:{password}".encode("utf-8")).decode("ascii").rstrip("=")
+    host = f"[{info['addr']}]" if ":" in str(info["addr"]) else info["addr"]
+    out = f"ss://{userinfo}@{host}:{_port_first(info.get('port'))}"
+    if info.get("plugin"):
+        plugin = info["plugin"]
+        if info.get("plugin_args"):
+            plugin += ";" + info["plugin_args"]
+        out += "?plugin=" + urllib.parse.quote(plugin, safe="")
+    return out + frag
+
+
+def filter_links_for_service(links, service, log_fn=None):
+    """Drop links that would make sing-box reject the whole config."""
+    good, dropped = [], []
+    for link in links:
+        fatal, _warn = link_issues(link, service)
+        if fatal:
+            dropped.append((link, fatal))
+        else:
+            good.append(normalize_link_for_upload(link))
+    if dropped and log_fn:
+        log_fn(f"🧹 Несовместимых с {service} ссылок: {len(dropped)} — пропускаю, "
+               f"чтобы sing-box принял остальные.")
+        for link, reasons in dropped[:8]:
+            info = parse_proxy_link(link)
+            label = info.get("name") or info.get("addr") or link[:40]
+            log_fn(f"   ✗ {label}: {'; '.join(reasons)}")
+        if len(dropped) > 8:
+            log_fn(f"   … и ещё {len(dropped) - 8}")
+    return good, dropped
+
+
 def _b64_text_candidates(text):
     """Plausible decodings of a base64 body (panels use std or url-safe, with
     and without padding and line breaks)."""
@@ -1671,6 +1860,104 @@ def _links_from_structured(text):
     return []
 
 
+class SubscriptionBlocked(Exception):
+    """Панель вернула не конфиг, а заглушку про HWID/лимит устройств."""
+
+    def __init__(self, message, support=None):
+        super().__init__(message)
+        self.support = support
+
+
+def _hget(headers, name):
+    try:
+        value = headers.get(name)
+        if value is not None:
+            return value
+    except Exception:
+        pass
+    for key, value in (headers or {}).items():
+        if key.lower() == name.lower():
+            return value
+    return None
+
+
+def _is_placeholder_link(link):
+    """Remnawave отдаёт vless://000…@0.0.0.0:1 с подписью HWID Required/Device Limit."""
+    low = (link or "").lower()
+    if not low:
+        return False
+    if "hwid%20required" in low or "device%20limit" in low:
+        return True
+    if "hwid required" in low or "device limit" in low:
+        return True
+    if "00000000-0000-0000-0000-000000000000" in low:
+        return True
+    match = re.match(r"[a-z0-9]+://[^@]*@(\[[^\]]+\]|[^:/?#]+):(\d+)", low)
+    if match and match.group(1) in ("0.0.0.0", "::", "[::]"):
+        return True
+    return False
+
+
+def subscription_block_message(body, headers):
+    low = (body or "").lower()
+    limit = ("device limit" in low or "device%20limit" in low
+             or (_hget(headers, "x-device-limit-exceeded") or "").lower() == "true")
+    hwid_required = ("hwid required" in low or "hwid%20required" in low
+                     or (_hget(headers, "x-hwid-not-supported") or "").lower() == "true")
+    if not (limit or hwid_required):
+        return None
+    support = _hget(headers, "support-url") or _hget(headers, "announce-url")
+    if limit:
+        msg = ("🔒 Панель сообщает, что лимит устройств (HWID) исчерпан. "
+               "Освободите слот устройства в личном кабинете/боте панели и повторите.")
+    else:
+        msg = ("🔒 Панель требует HWID. Включите маскировку клиента Happ/INCY "
+               "или укажите зарегистрированный HWID в настройках.")
+    if support:
+        msg += f"\n   Поддержка панели: {support}"
+    return msg
+
+
+def extract_panel_subscription(text):
+    """Достаёт данные из HTML-страницы подписки Remnawave/GEKON (data-panel=base64)."""
+    if not text or "data-panel" not in text:
+        return None
+    match = re.search(r'data-panel\s*=\s*(["\'])([^"\']+)\1', text, re.S)
+    if not match:
+        return None
+    raw = match.group(2).strip()
+    data = None
+    for candidate in (raw, urllib.parse.unquote(raw)):
+        blob = None
+        try:
+            blob = b64_decode_bytes(candidate)
+        except Exception:
+            continue
+        try:
+            data = json.loads(blob.decode("utf-8"))
+            break
+        except Exception:
+            continue
+    if not isinstance(data, dict):
+        return None
+    response = data.get("response") if isinstance(data.get("response"), dict) else data
+    urls = []
+    for key in ("happSubscriptionUrl", "incySubscriptionUrl", "subscriptionUrl"):
+        value = (response.get(key) or "").strip()
+        if value and value not in urls:
+            urls.append(value)
+    links = []
+    for item in response.get("links") or []:
+        item = str(item).strip()
+        if item and item.startswith(SCHEMES):
+            links.append(item)
+    return {
+        "urls": urls,
+        "links": dedup_links(links),
+        "user": response.get("user") or {},
+    }
+
+
 def parse_subscription_text(text):
     text = (text or "").strip()
     if not text:
@@ -1685,10 +1972,66 @@ def parse_subscription_text(text):
                 break
     if not result:
         result = [l.strip() for l in text.splitlines() if l.strip().startswith(SCHEMES)]
+    result = [l for l in result if not _is_placeholder_link(l)]
     unique = dedup_links(result)
     PARSE_STATS["raw"] = len(result)
     PARSE_STATS["unique"] = len(unique)
     return unique
+
+
+def resolve_subscription_body(body, sub_url, ident, log_fn, proxy=None, anon=False):
+    """Если пришла HTML-страница подписки, достаёт из неё deep-link и идёт по нему."""
+    links = parse_subscription_text(body)
+    if links:
+        return links, sub_url
+    panel = extract_panel_subscription(body)
+    if not panel:
+        return [], sub_url
+    user = panel.get("user") or {}
+    if user:
+        log_fn(f"🧩 Страница подписки: {user.get('username', '?')} · "
+               f"осталось {user.get('daysLeft', '?')} дн. · трафик {user.get('trafficUsed', '?')}")
+    if panel.get("links"):
+        log_fn(f"✅ На странице найдено готовых ссылок: {len(panel['links'])}")
+        return panel["links"], sub_url
+
+    candidates = []
+    for raw_url in panel.get("urls") or []:
+        try:
+            resolved = decrypt_link(raw_url)
+        except Exception as e:
+            log_fn(f"⚠️ Ссылка панели не расшифровалась: {str(e)[:90]}")
+            continue
+        if not resolved.startswith("http") or resolved == sub_url:
+            continue
+        if resolved not in candidates:
+            candidates.append(resolved)
+    if not candidates:
+        raise SubscriptionBlocked("🔒 Страница подписки не содержит рабочей ссылки (только заглушки).")
+
+    blocked = None
+    for candidate in candidates[:3]:
+        log_fn(f"🔗 Внутренняя ссылка панели: {candidate}")
+        try:
+            inner_body = fetch_direct(candidate, ident, log_fn, proxy=proxy, anon=anon)
+        except SubscriptionBlocked as e:
+            blocked = e
+            log_fn(f"⚠️ {str(e).splitlines()[0]}")
+            continue
+        except Exception as e:
+            log_fn(f"⚠️ {str(e)[:90]}")
+            continue
+        inner_links = parse_subscription_text(inner_body)
+        if inner_links:
+            return inner_links, candidate
+        if blocked is None:
+            blocked = SubscriptionBlocked(
+                subscription_block_message(inner_body, {}) or
+                "🔒 Панель не отдала список серверов (возможно, нужен HWID)."
+            )
+    if blocked:
+        raise blocked
+    raise SubscriptionBlocked("🔒 Панель не отдала список серверов.")
 
 
 def _quic_initial_packet(version_bytes, total_size=1200):
@@ -1885,9 +2228,14 @@ def fetch_direct(sub_url, ident, log_fn, proxy=None, anon=False):
         if len(strategies) >= 10:
             break
     strategies.insert(1, (native_ua, "chrome"))
+    # Страницы подписок (Remnawave/GEKON) отдают HTML только браузерному клиенту.
+    if "/api/" not in sub_url:
+        strategies.insert(0, (BROWSER_UA, "chrome"))
+    else:
+        strategies.append((BROWSER_UA, "chrome"))
     last = None
     for ua, impersonate in strategies:
-        headers = build_subscription_headers(ident, ua=ua)
+        headers = dict(BROWSER_HEADERS) if ua == BROWSER_UA else build_subscription_headers(ident, ua=ua)
         for attempt in (1, 2):
             try:
                 if anon:
@@ -1898,11 +2246,18 @@ def fetch_direct(sub_url, ident, log_fn, proxy=None, anon=False):
                 if resp.status_code in bad:
                     raise Exception(f"HTTP {resp.status_code}")
                 body = resp.text or ""
-                if body.strip() and parse_subscription_text(body):
+                blocked_msg = subscription_block_message(body, resp.headers)
+                if blocked_msg:
+                    log_fn(f"⚠️ {blocked_msg.splitlines()[0]}")
+                    raise SubscriptionBlocked(
+                        blocked_msg, support=_hget(resp.headers, "support-url"))
+                if body.strip() and (parse_subscription_text(body) or extract_panel_subscription(body)):
                     log_fn(f"✅ Канал B сработал: {len(body)} байт (UA={short_ua})")
                     return body
                 last = Exception(f"HTTP {resp.status_code}: тело не похоже на подписку")
                 log_fn(f"⚠️ {last}")
+            except SubscriptionBlocked:
+                raise
             except Exception as e:
                 last = e
                 log_fn(f"⚠️ {str(e)[:70]}")
@@ -2130,7 +2485,8 @@ def _sb_tls(info, default_alpn=None, force=False):
     else:
         if fp:
             tls["utls"] = {"enabled": True, "fingerprint": fp}
-        tls["insecure"] = True
+        if str(info.get("allow_insecure") or "").lower() in ("1", "true", "yes"):
+            tls["insecure"] = True
     frag = info.get("fragment")
     if frag:
         parts = frag.split(",")
@@ -2712,6 +3068,9 @@ class RouterSSH:
                    + ", ".join(f"{k}={v}" for k, v in sorted(skipped.items())))
         if not supported:
             raise Exception("Ни одна ссылка не подходит выбранному сервису")
+        supported, _broken = filter_links_for_service(supported, self.service, log_fn)
+        if not supported:
+            raise Exception(f"Все ссылки несовместимы с {self.service} — подробности в журнале")
         links = supported
 
         tmp = "/tmp/_decoder_links.txt"
@@ -2899,7 +3258,8 @@ class DecoderApp:
         self.link_var = tk.StringVar()
         e_link = ttk.Entry(row_link, textvariable=self.link_var, font=("Consolas", 10))
         e_link.pack(side="left", fill="x", expand=True, padx=(8, 6))
-        tip(e_link, "Вставьте happ://crypt…, happ://add/URL или прямой https:// URL подписки.")
+        tip(e_link, "Вставьте happ://crypt…, incy://crypt1/…, happ://add/URL, прямой https:// URL "
+                    "или страницу подписки https://…/sub/… — программа сама найдёт внутри ссылку.")
         b_paste = ttk.Button(row_link, text="📋 Вставить", style="Soft.TButton", command=self.paste_link)
         b_paste.pack(side="left")
         tip(b_paste, "Вставить ссылку из буфера обмена.")
@@ -3040,7 +3400,7 @@ class DecoderApp:
 
         tree_wrap = ttk.Frame(tab2)
         tree_wrap.pack(fill="both", expand=True, padx=PAD, pady=(2, 14))
-        cols = ("status", "ms", "name", "endpoint", "proto")
+        cols = ("status", "ms", "name", "endpoint", "proto", "note")
         self.tree = ttk.Treeview(tree_wrap, columns=cols, show="headings", selectmode="extended")
         vsb = ttk.Scrollbar(tree_wrap, orient="vertical")
         hsb = ttk.Scrollbar(tree_wrap, orient="horizontal")
@@ -3055,7 +3415,8 @@ class DecoderApp:
                 ("ms", "Пинг", 90, "center"),
                 ("name", "Имя сервера", 420, "w"),
                 ("endpoint", "Адрес:порт", 300, "w"),
-                ("proto", "Протокол / защита", 240, "w")):
+                ("proto", "Протокол / защита", 240, "w"),
+                ("note", "Проверка / совместимость", 300, "w")):
             self.tree.heading(cid, text=ctext)
             self.tree.column(cid, width=cw, anchor=ca, stretch=False)
         self.tree.tag_configure("alive", background="#e9f7ef", foreground="#1d7a46")
@@ -3632,17 +3993,34 @@ class DecoderApp:
             if not links:
                 self.busy(True, "Канал B: прямое скачивание с TLS-маскировкой...")
                 self.log("🔁 Пробую напрямую...")
+                blocked_error = None
                 try:
                     body = fetch_direct(final_url, ident, self.log,
                                         proxy=proxy, anon=self.anon_var.get())
-                    links = parse_subscription_text(body)
+                    links, resolved_url = resolve_subscription_body(
+                        body, final_url, ident, self.log,
+                        proxy=proxy, anon=self.anon_var.get())
+                    if resolved_url != final_url:
+                        final_url = resolved_url
+                        self.sub_url = resolved_url
+                        self.log(f"🌐 Рабочий URL подписки: {resolved_url}")
+                        self.root.after(0, self.on_upload_mode_change)
+                except SubscriptionBlocked as e:
+                    blocked_error = e
+                    self.log(f"⚠️ {e}")
                 except Exception as e:
                     self.log(f"⚠️  Канал B не удался: {str(e)[:80]}")
             if not links:
-                self.log("\n🧱 Оба канала отбиты сервером.")
-                self.log(f"💡 Откройте URL в браузере и используйте «📥 Вставить JSON»:\n👉 {final_url}")
-                self.busy(False, "Сервер отбил запрос — используйте «Вставить JSON»")
+                if blocked_error:
+                    self.log("\n" + str(blocked_error))
+                    self.log("💡 Ссылка расшифрована, но панель не выдаёт конфиг без свободного слота HWID.")
+                    self.busy(False, "Панель: лимит устройств (HWID)")
+                else:
+                    self.log("\n🧱 Оба канала отбиты сервером.")
+                    self.log(f"💡 Откройте URL в браузере и используйте «📥 Вставить JSON»:\n👉 {final_url}")
+                    self.busy(False, "Сервер отбил запрос — используйте «Вставить JSON»")
                 return
+
             raw = PARSE_STATS.get("raw", len(links))
             dup = raw - len(links)
             stats = {}
@@ -3654,6 +4032,9 @@ class DecoderApp:
             self.log(f"   Протоколы: {', '.join(f'{k}={v}' for k, v in sorted(stats.items()))}")
             self.log("💡 Вкладка «Ссылки и проверка»: ⚡ Проверить. Вкладка «Роутер»: 🚀 Залить.")
             self.finish(links)
+        except SubscriptionBlocked as e:
+            self.log(f"\n{e}")
+            self.busy(False, "Панель не выдала конфиг (HWID)")
         except Exception as e:
             self.log(f"\n❌ ОШИБКА: {e}")
             if final_url:
@@ -3687,10 +4068,33 @@ class DecoderApp:
     def finish(self, links):
         self.links_result = links
         self.rows = []
+        bad = 0
+        warned = 0
         for l in links:
             info = parse_proxy_link(l)
-            info.update({"link": l, "status": "pending", "ms": None, "note": "ещё не проверен"})
+            fatal, warn = link_issues(l)
+            notes = []
+            if fatal:
+                bad += 1
+                notes.append("⚠️ " + "; ".join(fatal))
+            elif warn:
+                warned += 1
+                notes.append("⚠️ " + "; ".join(warn))
+            info.update({"link": l, "status": "pending", "ms": None,
+                         "note": "ещё не проверен", "issues": notes,
+                         "issues_text": "; ".join(notes)})
             self.rows.append(info)
+        if bad or warned:
+            self.log(f"\n🩺 Совместимость: проблемных {bad}, предупреждений {warned} "
+                     f"из {len(links)}. Проблемные не будут залиты на роутер.")
+            shown = 0
+            for r in self.rows:
+                if r["issues"]:
+                    self.log(f"   ⚠️ {r.get('name') or r.get('addr') or '?'}: "
+                             f"{r['issues_text'].lstrip('⚠️ ')}")
+                    shown += 1
+                    if shown >= 8:
+                        break
 
         def _en():
             self.run_btn.config(state="normal")
@@ -3759,7 +4163,7 @@ class DecoderApp:
 
     def autofit_tree(self):
         f = self._tree_font
-        cols = ("status", "ms", "name", "endpoint", "proto")
+        cols = ("status", "ms", "name", "endpoint", "proto", "note")
         widths = {cid: f.measure(self.tree.heading(cid, "text")) + 26 for cid in cols}
         for iid in self._all_iids():
             vals = self.tree.item(iid, "values")
@@ -3772,6 +4176,7 @@ class DecoderApp:
         widths["name"] = max(220, min(widths["name"], 760))
         widths["endpoint"] = max(170, min(widths["endpoint"], 460))
         widths["proto"] = max(150, min(widths["proto"], 340))
+        widths["note"] = max(160, min(widths["note"], 420))
         total = sum(widths.values())
         try:
             avail = self.tree.winfo_width()
@@ -3800,7 +4205,11 @@ class DecoderApp:
                                    values=(STATUS_ICON.get(r["status"], r["status"]), ms,
                                            name_display,
                                            f"{r['addr']}:{r['port']}",
-                                           f"{r['proto']} / {r['security']}"))
+                                           f"{r['proto']} / {r['security']}",
+                                           " · ".join(x for x in (
+                                               r.get("issues_text"),
+                                               r["note"] if r["note"] != "ещё не проверен" else ""
+                                           ) if x)))
             self.iid2link[iid] = r["link"]
 
         if self.group_by_country_var.get():
@@ -4161,7 +4570,8 @@ class DecoderApp:
         desc = (
             "Программа для анонимного получения, проверки и экспорта VPN-подписок.\n\n"
             "🔑 Основные возможности:\n"
-            "  • Дешифровка ссылок happ://crypt…crypt5 (RSA-4096)\n"
+            "  • Дешифровка ссылок happ://crypt…crypt5 (RSA-4096) и incy://crypt1 (AES-256-GCM)\n"
+            "  • Автоматический разбор страниц подписок Remnawave/GEKON (data-panel)\n"
             "  • Протоколы: VLESS, VMess, Trojan, Shadowsocks, Hysteria2, TUIC,\n"
             "    AnyTLS, ShadowTLS, NaïveProxy, Socks4/4a/5\n"
             "  • Маскировка клиента как Happ / INCY (UA, X-HWID, X-Device-*)\n"
@@ -4205,7 +4615,9 @@ class DecoderApp:
         p("Программа предназначена для безопасного получения и работы с VPN-подписками. "
           "Ниже — пошаговое описание каждой вкладки.")
         h("Вкладка 1: ⚙️ Декодер")
-        p("1. Вставьте зашифрованную ссылку вида happ://crypt… или happ://crypt5/… в поле «Ссылка на подписку».")
+        p("1. Вставьте зашифрованную ссылку вида happ://crypt…, happ://crypt5/… или "
+          "incy://crypt1/… в поле «Ссылка на подписку». Можно вставить и обычную "
+          "страницу подписки https://…/sub/… — программа сама достанет из неё deep-link.")
         p("2. Включите «Анонимный режим», если не хотите привязываться к HWID (рекомендуется).")
         p("3. «Клиент подписки»: Happ или INCY — программа отправляет точные User-Agent и "
           "X-HWID / X-Device-OS / X-Ver-OS / X-Device-Model, как реальное приложение "
@@ -4217,11 +4629,17 @@ class DecoderApp:
         p("6. Кнопка «📋 Вставить JSON» разбирает буфер обмена (Xray JSON / sing-box JSON / "
           "Clash YAML / Base64 / список ссылок).")
         p("7. Кнопка «🔄 Сброс» полностью очищает состояние — удобно для новой подписки.")
+        p("⚠️ Если панель отвечает «HWID Required» или «Device Limit», конфиг не выдаётся: "
+          "включите маскировку клиента Happ/INCY или освободите слот устройства в личном "
+          "кабинете панели (у некоторых провайдеров лимит — 1 устройство).")
         h("Вкладка 2: 🔗 Ссылки и проверка")
         p("1. Нажмите «⚡ Проверить доступность» — программа параллельно (16 потоков) проверит "
           "каждый сервер: TCP/TLS-хендшейк для VLESS/Trojan/VMess/AnyTLS, QUIC Initial для "
           "Hysteria2/TUIC, обычный TCP для Shadowsocks/Socks/NaïveProxy.")
         p("2. Результаты: ✅ жив / ❓ UDP-неопределён / ❌ мёртв.")
+        p("⚠️ Проверка показывает доступность порта и TLS/QUIC-хендшейк, а не корректность "
+          "ключа: сервер может быть «жив», но отклонять неверный UUID/пароль/транспорт. "
+          "Если ссылка не работает в NetShift, проверьте security/reality/pbk/sni и тип транспорта.")
         p("3. Поставьте галочку «Только живые», чтобы скрыть недоступные серверы.")
         p("4. Выделите нужные серверы (Ctrl/Shift) и экспортируйте через кнопки внизу:")
         p("   • 📦 sing-box 1.12+/1.14 (TUN address, sniff/hijack-dns, reality/utls, "
